@@ -1,0 +1,397 @@
+---
+title: "Tugas Praktikum MPDW | Pemodelan ARIMA Harga Penutupan Saham BBCA"
+author: "Syarifah Nabila Jusman | M0401241038"
+date: "29-9-2026"
+output:
+  rmdformats::readthedown:
+    highlight: pygments
+    toc_depth: 3
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 4.5)
+
+library(forecast)   
+library(tseries)   
+library(lmtest) 
+library(knitr)    
+options(digits = 5)
+```
+
+# Pendahuluan dan Data
+
+Praktikum ini memodelkan **harga penutupan (*Close*) harian saham BBCA** dengan
+metode ARIMA mengikuti delapan tahapan Box-Jenkins:
+
+1. Pembagian data latih dan data uji
+2. Pemeriksaan kestasioneran data latih (rataan dan ragam)
+3. Penanganan ketidakstasioneran (diferensiasi / transformasi)
+4. Identifikasi model potensial (ACF, PACF, EACF)
+5. Pendugaan parameter: uji signifikansi dan AIC
+6. Analisis sisaan
+7. Overfitting
+8. Peramalan
+
+```{r data}
+bbca <- read.csv("C:\\Users\\syari\\Downloads\\BBCA_Historical_Data_3_Tahun_2023_2026.csv")
+bbca$Date <- as.Date(bbca$Date)
+bbca <- bbca[order(bbca$Date), ]
+
+n_total <- nrow(bbca)
+kable(head(bbca, 5), caption = "Lima baris pertama data")
+```
+
+```{r data-cek}
+data.frame(
+  Jumlah_amatan  = n_total,
+  Data_hilang    = sum(is.na(bbca)),
+  Tanggal_awal   = format(min(bbca$Date)),
+  Tanggal_akhir  = format(max(bbca$Date)),
+  Close_min      = min(bbca$Close),
+  Close_maks     = max(bbca$Close)
+)
+```
+
+Data terdiri dari **784 amatan**
+tanpa nilai hilang. Data hanya memuat hari bursa, sehingga amatan diperlakukan sebagai deret waktu berurutan (tanpa musiman kalender).
+
+```{r plot-full}
+plot(bbca$Date, bbca$Close, type = "l", col = "steelblue", lwd = 1.5,
+     xlab = "Tanggal", ylab = "Close (Rp)", main = "Harga Penutupan BBCA")
+grid()
+```
+
+# Pembagian Data Latih dan Data Uji
+
+Data dibagi **90% latih : 10% uji**. 
+Proporsi ini dipilih karena:
+(i) model ARIMA membutuhkan data latih yang panjang agar pendugaan parameter stabil dan
+(ii) data uji sekitar satu kuartal bursa sudah cukup untuk menilai peramalan jangka menengah, sementara peramalan yang terlalu jauh pada deret mirip *random walk* akan sangat melebar tanpa menambah informasi.
+
+```{r split}
+prop_train <- 0.90
+n_train <- floor(prop_train * n_total)
+
+train_df <- bbca[1:n_train, ]
+test_df  <- bbca[(n_train + 1):n_total, ]
+
+train <- ts(train_df$Close)   
+test  <- test_df$Close
+
+data.frame(
+  Bagian = c("Latih", "Uji"),
+  Amatan = c(nrow(train_df), nrow(test_df)),
+  Dari   = c(format(min(train_df$Date)), format(min(test_df$Date))),
+  Sampai = c(format(max(train_df$Date)), format(max(test_df$Date)))
+)
+```
+
+```{r plot-split}
+plot(train_df$Date, train_df$Close, type = "l", col = "steelblue", lwd = 1.5,
+     xlim = range(bbca$Date), ylim = range(bbca$Close),
+     xlab = "Tanggal", ylab = "Close (Rp)", main = "Pembagian Data Latih dan Uji")
+lines(test_df$Date, test_df$Close, col = "firebrick", lwd = 1.5)
+legend("topleft", legend = c("Latih", "Uji"), col = c("steelblue", "firebrick"),
+       lty = 1, bty = "n")
+grid()
+```
+
+# Kestasioneran Data Latih
+
+## Kestasioneran dalam Rataan
+
+Pemeriksaan menggunakan plot deret waktu, plot ACF, dan uji *Augmented
+Dickey-Fuller* (ADF) dengan hipotesis:
+
+- $H_0$: data tidak stasioner (memiliki akar unit)
+- $H_1$: data stasioner
+
+```{r stasioner-rataan}
+par(mfrow = c(1, 2))
+ts.plot(train, main = "Data Latih (level)", ylab = "Close")
+acf(train, lag.max = 40, main = "ACF Data Latih (level)")
+par(mfrow = c(1, 1))
+
+adf_level <- adf.test(train)
+adf_level
+```
+
+Plot deret menunjukkan pergerakan naik-turun yang tidak kembali ke satu rataan tetap, dan ACF meluruh sangat lambat (*tails off slowly*). Uji ADF memberikan p-value = **`r round(adf_level$p.value, 4)`**, sehingga pada $\alpha = 5\%$
+`r ifelse(adf_level$p.value < 0.05, "$H_0$ ditolak: data stasioner dalam rataan.", "$H_0$ **tidak** ditolak: data **tidak stasioner dalam rataan** dan perlu diferensiasi.")`
+
+## Kestasioneran dalam Ragam (Box-Cox)
+
+Kestasioneran ragam diperiksa dengan transformasi Box-Cox pada data latih. Ragam dianggap stasioner jika selang kepercayaan 95% bagi $\lambda$ **memuat angka 1** (artinya tidak perlu transformasi).
+
+```{r boxcox}
+bc <- MASS::boxcox(train ~ 1, lambda = seq(-3, 4, by = 0.01), plotit = FALSE)
+batas <- max(bc$y) - qchisq(0.95, 1) / 2
+dalam_ci <- bc$x[bc$y >= batas]
+
+lambda_opt <- bc$x[which.max(bc$y)]
+ci_bawah   <- min(dalam_ci)
+ci_atas    <- max(dalam_ci)
+
+plot(bc$x, bc$y, type = "l", lwd = 2, xlab = expression(lambda),
+     ylab = "log-likelihood", main = "Box-Cox Data Latih")
+abline(h = batas, lty = 2)
+abline(v = c(ci_bawah, ci_atas), lty = 3)
+abline(v = lambda_opt, col = "blue")
+abline(v = 1, col = "red", lwd = 2)
+legend("bottomleft", bty = "n", lty = c(1, 1, 3),
+       col = c("blue", "red", "black"),
+       legend = c("lambda optimum", "lambda = 1", "batas CI 95%"))
+
+data.frame(Lambda_optimum = lambda_opt, CI_bawah = ci_bawah, CI_atas = ci_atas,
+           Memuat_1 = (ci_bawah <= 1 & ci_atas >= 1))
+```
+
+Nilai $\lambda$ optimum = **`r round(lambda_opt, 2)`** dengan selang kepercayaan 95%
+**[`r round(ci_bawah, 2)`; `r round(ci_atas, 2)`]**, yang
+`r ifelse(ci_bawah <= 1 & ci_atas >= 1, "**memuat angka 1**, sehingga ragam data latih dinilai stasioner dan **tidak diperlukan transformasi**.", "**tidak memuat angka 1**, sehingga diperlukan transformasi sesuai nilai $\\lambda$.")`
+
+# Penanganan Ketidakstasioneran
+
+Karena data tidak stasioner dalam rataan, dilakukan **diferensiasi orde 1** ($d = 1$). Transformasi tidak dilakukan karena ragam sudah stasioner
+(tahap sebelumnya).
+
+```{r diff}
+train_d1 <- diff(train)
+
+par(mfrow = c(1, 2))
+ts.plot(train_d1, main = "Data Latih Setelah Diferensiasi (d=1)", ylab = "Selisih Close")
+abline(h = 0, col = "red", lty = 2)
+acf(train_d1, lag.max = 40, main = "ACF Setelah Diferensiasi")
+par(mfrow = c(1, 1))
+
+adf_d1 <- adf.test(train_d1)
+adf_d1
+```
+
+Setelah diferensiasi, data berfluktuasi di sekitar nol dan ACF tidak lagi meluruh lambat. Uji ADF memberikan p-value = **`r format(adf_d1$p.value, digits = 3)`**
+(`r ifelse(adf_d1$p.value < 0.05, "< 0,05", "> 0,05")`), sehingga
+`r ifelse(adf_d1$p.value < 0.05, "data hasil diferensiasi **stasioner dalam rataan**. Orde diferensiasi yang dipakai: **d = 1**.", "data masih belum stasioner dan diferensiasi perlu dilanjutkan.")`
+
+# Identifikasi Model Potensial
+
+Identifikasi dilakukan pada data hasil diferensiasi melalui ACF, PACF, dan EACF.
+
+```{r identifikasi}
+par(mfrow = c(1, 2))
+acf(train_d1,  lag.max = 25, main = "ACF (d=1)")
+pacf(train_d1, lag.max = 25, main = "PACF (d=1)")
+par(mfrow = c(1, 1))
+```
+
+```{r eacf}
+TSA::eacf(train_d1)
+```
+
+```{r batas-lag}
+batas_acf <- qnorm(0.975) / sqrt(length(train_d1))
+r_acf  <- acf(train_d1,  lag.max = 25, plot = FALSE)$acf[-1]
+r_pacf <- pacf(train_d1, lag.max = 25, plot = FALSE)$acf
+
+lag_acf  <- which(abs(r_acf)  > batas_acf)
+lag_pacf <- which(abs(r_pacf) > batas_acf)
+```
+
+Batas signifikansi ±`r round(batas_acf, 3)`. Dari 25 lag yang
+diperiksa, lag ACF yang melewati batas: **`r ifelse(length(lag_acf) == 0, "tidak ada", paste(lag_acf, collapse = ", "))`**;
+lag PACF yang melewati batas: **`r ifelse(length(lag_pacf) == 0, "tidak ada", paste(lag_pacf, collapse = ", "))`**.
+Dengan taraf 5%, sekitar 1 dari 20 lag memang diharapkan melewati batas hanya karena kebetulan, sehingga satu-dua lag yang tipis melewati batas belum tentu mencerminkan struktur AR/MA yang nyata. Pola EACF juga didominasi simbol "o" (segitiga nol dimulai dari AR(0), MA(0)).
+
+Artinya data hasil diferensiasi **hampir menyerupai *white noise* **, dan model paling sederhana, **ARIMA(0,1,0)**, menjadi kandidat utama. Agar kesimpulan ini diuji dan bukan hanya diasumsikan, kandidat lain di sekitarnya juga dibandingkan: ARIMA(1,1,0), ARIMA(0,1,1), ARIMA(1,1,1), ARIMA(2,1,0), ARIMA(0,1,2), serta ARIMA(0,1,0) dengan *drift*.
+
+# Pendugaan Parameter, Signifikansi, dan AIC
+
+Setiap koefisien diuji dengan uji-z ($H_0$: koefisien = 0), lalu model
+dibandingkan berdasarkan AIC (semakin kecil semakin baik).
+
+```{r kandidat}
+ringkas <- function(m, nama) {
+  k <- length(coef(m))
+  if (k > 0) {
+    p <- 2 * pnorm(-abs(coef(m) / sqrt(diag(vcov(m)))))
+    maks_p <- max(p); sig <- all(p < 0.05)
+  } else {
+    maks_p <- NA; sig <- NA   
+  }
+  data.frame(Model = nama, Jumlah_parameter = k, AIC = m$aic, BIC = m$bic,
+             Maks_p_value = maks_p, Semua_signifikan = sig)
+}
+
+orde_kandidat <- list(c(0,1,0), c(1,1,0), c(0,1,1), c(1,1,1), c(2,1,0), c(0,1,2))
+fits <- lapply(orde_kandidat, function(o) Arima(train, order = o, method = "ML"))
+nama <- sapply(orde_kandidat, function(o) sprintf("ARIMA(%d,%d,%d)", o[1], o[2], o[3]))
+names(fits) <- nama
+
+fits[["ARIMA(0,1,0) + drift"]] <- Arima(train, order = c(0,1,0), include.drift = TRUE, method = "ML")
+
+tabel_model <- do.call(rbind, lapply(names(fits), function(nm) ringkas(fits[[nm]], nm)))
+tabel_model <- tabel_model[order(tabel_model$AIC), ]
+rownames(tabel_model) <- NULL
+kable(tabel_model, digits = 3, caption = "Perbandingan model kandidat (diurutkan menurut AIC)")
+```
+
+Aturan pemilihan: model terbaik adalah yang **AIC-nya terkecil di antara model yang seluruh parameternya signifikan** (model tanpa parameter otomatis memenuhi).
+
+```{r pilih}
+layak <- is.na(tabel_model$Semua_signifikan) | tabel_model$Semua_signifikan
+model_terbaik <- tabel_model$Model[layak][which.min(tabel_model$AIC[layak])]
+fit_terbaik   <- fits[[model_terbaik]]
+orde_terbaik  <- arimaorder(fit_terbaik)   # p, d, q
+model_terbaik
+```
+
+Model terpilih: **`r model_terbaik`**. Pada model kandidat yang memiliki
+parameter (AR atau MA), nilai p-value terbesarnya jauh di atas 0,05 sehingga penambahan suku AR/MA tidak memberi kontribusi nyata, sedangkan AIC-nya pun tidak lebih baik. Model dengan *drift* juga tidak dipilih karena AIC lebih besar
+dan `r if ("drift" %in% names(coef(fits[["ARIMA(0,1,0) + drift"]]))) paste0("koefisien drift tidak signifikan (p = ", round(coeftest(fits[["ARIMA(0,1,0) + drift"]])["drift", 4], 3), ").") else "drift tidak diperlukan."`
+
+```{r ringkasan-fit}
+fit_terbaik
+```
+
+# Analisis Sisaan
+
+Asumsi yang diperiksa: sisaan berdistribusi normal, tidak berautokorelasi
+(*white noise*), bernilai tengah nol, dan berragam homogen.
+
+```{r sisaan-plot}
+res <- as.numeric(residuals(fit_terbaik))
+par(mfrow = c(2, 2))
+plot(res, type = "l", main = "Plot Sisaan", ylab = "Sisaan", xlab = "Waktu"); abline(h = 0, col = "red", lty = 2)
+qqnorm(res, main = "Q-Q Plot Sisaan"); qqline(res, col = "red")
+acf(res, lag.max = 30, main = "ACF Sisaan")
+hist(res, breaks = 30, freq = FALSE, main = "Histogram Sisaan", xlab = "Sisaan")
+curve(dnorm(x, mean(res), sd(res)), add = TRUE, col = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+```{r sisaan-uji}
+k_par <- length(coef(fit_terbaik))   # derajat kebebasan yang dikoreksi
+lb   <- Box.test(res,   lag = 20, type = "Ljung-Box", fitdf = k_par)
+arch <- Box.test(res^2, lag = 20, type = "Ljung-Box")
+sw   <- shapiro.test(res)
+jb   <- jarque.bera.test(res)
+tt   <- t.test(res, mu = 0)
+
+uji_sisaan <- data.frame(
+  Asumsi = c("Normalitas", "Normalitas", "Tidak ada autokorelasi",
+             "Nilai tengah nol", "Ragam homogen (tanpa efek ARCH)"),
+  Uji    = c("Shapiro-Wilk", "Jarque-Bera", "Ljung-Box (lag 20)",
+             "t-test (mu = 0)", "Ljung-Box pada sisaan kuadrat (lag 20)"),
+  p_value = c(sw$p.value, jb$p.value, lb$p.value, tt$p.value, arch$p.value)
+)
+uji_sisaan$Keputusan <- ifelse(uji_sisaan$p_value > 0.05, "Asumsi terpenuhi", "Asumsi dilanggar")
+kable(uji_sisaan, digits = 4, caption = "Uji asumsi sisaan (H0 = asumsi terpenuhi, alpha = 5%)")
+```
+
+**Kesimpulan sisaan.** Dari lima uji, **`r sum(uji_sisaan$p_value > 0.05)` dari 5**
+menyatakan asumsi terpenuhi. Sisaan
+`r ifelse(lb$p.value > 0.05, "tidak berautokorelasi", "masih berautokorelasi")`,
+`r ifelse(tt$p.value > 0.05, "bernilai tengah nol", "tidak bernilai tengah nol")`,
+`r ifelse(min(sw$p.value, jb$p.value) > 0.05, "menyebar normal", "tidak menyebar normal")`, dan
+`r ifelse(arch$p.value > 0.05, "tidak menunjukkan efek ARCH (ragam homogen).", "menunjukkan efek ARCH (ragam tidak homogen), sehingga model volatilitas seperti GARCH dapat dipertimbangkan sebagai pengembangan.")`
+
+# Overfitting
+
+Model terpilih diuji dengan menambahkan **satu** parameter AR atau MA. Jika
+parameter tambahan tidak signifikan dan AIC tidak membaik, model awal tidak
+kekurangan suku (tidak *underfit*) dan tidak perlu diperumit.
+
+```{r overfit}
+p0 <- orde_terbaik[1]; d0 <- orde_terbaik[2]; q0 <- orde_terbaik[3]
+
+cek_over <- function(o, suku) {
+  m <- Arima(train, order = o, method = "ML")
+  p <- 2 * pnorm(-abs(coef(m) / sqrt(diag(vcov(m)))))
+  data.frame(Model = sprintf("ARIMA(%d,%d,%d)", o[1], o[2], o[3]),
+             Parameter_tambahan = suku,
+             Estimasi = unname(coef(m)[suku]),
+             p_value  = unname(p[suku]),
+             AIC = m$aic)
+}
+
+tabel_over <- rbind(
+  cek_over(c(p0 + 1, d0, q0), paste0("ar", p0 + 1)),
+  cek_over(c(p0, d0, q0 + 1), paste0("ma", q0 + 1))
+)
+tabel_over$AIC_model_terbaik <- fit_terbaik$aic
+tabel_over$Kesimpulan <- ifelse(tabel_over$p_value > 0.05 & tabel_over$AIC >= tabel_over$AIC_model_terbaik,
+                                "Tidak perlu (tidak signifikan, AIC tidak membaik)",
+                                "Perlu dipertimbangkan")
+kable(tabel_over, digits = 4, caption = "Uji overfitting")
+```
+
+Parameter tambahan pada kedua model *overfitting*
+`r ifelse(all(tabel_over$p_value > 0.05), "**tidak signifikan**", "ada yang signifikan")` dan
+AIC-nya `r ifelse(all(tabel_over$AIC >= fit_terbaik$aic), "tidak lebih kecil", "ada yang lebih kecil")`
+dari model terpilih, sehingga **`r model_terbaik` dipertahankan sebagai model akhir**.
+
+# Peramalan
+
+Peramalan dilakukan sepanjang data uji (**`r length(test)` hari bursa**) dan
+dibandingkan dengan nilai aktual.
+
+```{r forecast}
+h  <- length(test)
+fc <- forecast(fit_terbaik, h = h, level = c(80, 95))
+
+galat <- test - as.numeric(fc$mean)
+akurasi <- data.frame(
+  RMSE = sqrt(mean(galat^2)),
+  MAE  = mean(abs(galat)),
+  MAPE_persen = mean(abs(galat / test)) * 100,
+  Cakupan_PI95_persen = mean(test >= fc$lower[, 2] & test <= fc$upper[, 2]) * 100
+)
+kable(akurasi, digits = 3, caption = "Akurasi peramalan pada data uji")
+```
+
+```{r plot-forecast}
+tail_idx <- (n_train - 119):n_train
+plot(range(c(train_df$Date[tail_idx], test_df$Date)),
+     range(c(train_df$Close[tail_idx], test, fc$lower, fc$upper)),
+     type = "n", xlab = "Tanggal", ylab = "Close (Rp)",
+     main = paste("Peramalan", model_terbaik, "- Data Uji"))
+polygon(c(test_df$Date, rev(test_df$Date)), c(fc$lower[, 2], rev(fc$upper[, 2])),
+        col = rgb(0.8, 0.2, 0.2, 0.15), border = NA)
+polygon(c(test_df$Date, rev(test_df$Date)), c(fc$lower[, 1], rev(fc$upper[, 1])),
+        col = rgb(0.8, 0.2, 0.2, 0.25), border = NA)
+lines(train_df$Date[tail_idx], train_df$Close[tail_idx], col = "steelblue", lwd = 1.5)
+lines(test_df$Date, test, col = "black", lwd = 1.5)
+lines(test_df$Date, as.numeric(fc$mean), col = "firebrick", lwd = 2, lty = 2)
+legend("topleft", bty = "n", lwd = c(1.5, 1.5, 2, 8, 8), lty = c(1, 1, 2, 1, 1),
+       col = c("steelblue", "black", "firebrick", rgb(0.8, 0.2, 0.2, 0.25), rgb(0.8, 0.2, 0.2, 0.15)),
+       legend = c("Latih (120 terakhir)", "Aktual (uji)", "Ramalan", "PI 80%", "PI 95%"))
+grid()
+```
+
+**Interpretasi.** Pada data uji, RMSE = **`r round(akurasi$RMSE, 1)`** dan MAPE =
+**`r round(akurasi$MAPE_persen, 2)`%**. Selang prediksi 95% menutup
+**`r round(akurasi$Cakupan_PI95_persen, 1)`%** nilai aktual.
+`r if (all(orde_terbaik == c(0, 1, 0))) "Karena model terpilih adalah ARIMA(0,1,0) tanpa drift, ramalan tepat sama dengan nilai terakhir data latih (garis datar), atau setara dengan metode *naive*. Selang prediksi melebar seiring bertambahnya horizon karena ketidakpastian menumpuk." else "Ramalan mengikuti struktur AR/MA hasil pendugaan, dengan selang prediksi yang melebar seiring bertambahnya horizon."`
+
+# Kesimpulan
+
+```{r kesimpulan-tabel}
+data.frame(
+  Tahap = c("Stasioner rataan", "Stasioner ragam", "Diferensiasi", "Model terpilih",
+            "Sisaan", "Overfitting", "Akurasi forecast"),
+  Hasil = c(
+    paste0("ADF level p = ", round(adf_level$p.value, 3), ifelse(adf_level$p.value < 0.05, " (stasioner)", " (tidak stasioner)")),
+    paste0("Box-Cox CI [", round(ci_bawah, 2), "; ", round(ci_atas, 2), "]", ifelse(ci_bawah <= 1 & ci_atas >= 1, " memuat 1", " tidak memuat 1")),
+    paste0("d = 1, ADF p = ", format(adf_d1$p.value, digits = 2)),
+    model_terbaik,
+    paste0(sum(uji_sisaan$p_value > 0.05), " dari 5 uji asumsi terpenuhi"),
+    ifelse(all(tabel_over$p_value > 0.05), "Parameter tambahan tidak signifikan", "Ada parameter tambahan signifikan"),
+    paste0("RMSE ", round(akurasi$RMSE, 1), "; MAPE ", round(akurasi$MAPE_persen, 2), "%")
+  )
+) |> kable(caption = "Ringkasan seluruh tahapan")
+```
+
+Setelah diferensiasi, harga penutupan BBCA nyaris tidak menyisakan struktur autokorelasi yang bisa dimodelkan, sehingga model yang
+didukung data adalah *random walk* ARIMA(0,1,0). Ini bukan kegagalan
+pemodelan, melainkan temuan: perubahan harian harga saham sulit diprediksi dari riwayatnya sendiri. Konsekuensinya, ramalan ARIMA berfungsi sebagai **pembanding dasar (*baseline*)** dan hanya andal untuk arah sebaran ketidakpastian, bukan untuk menebak pergerakan harga.
